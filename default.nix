@@ -26,7 +26,11 @@ let
   scripts = with pkgs; {
     pg = __pg {
       postgres = pg;
-      extra_flags = "-c shared_preload_libraries=timescaledb";
+      # Bind localhost (local tooling: db_reset, ingester) + eldo's tailscale IP
+      # so atlantis can reach it over the tailnet. NOT '*': we don't expose the
+      # LAN NICs. Tailscale IPs are stable per-node, so hardcoding is safe. Who
+      # may connect is still gated by pg_hba.conf (see db_reset) + firewall.
+      extra_flags = "-c shared_preload_libraries=timescaledb -c listen_addresses='localhost,100.66.184.28'";
     };
     pg_bootstrap = __pg_bootstrap {
       inherit name;
@@ -39,13 +43,21 @@ let
     pg_shell = __pg_shell { inherit name; postgres = pg; };
 
     # One-shot local-dev DB prepare: wipe + bootstrap + load init/01_schema.sql
-    # (timescaledb extension + hypertables + continuous aggregates) against a
-    # temporary preloaded server, then stop. Run from the repo root, then `__pg`
-    # to serve. DESTRUCTIVE: wipes $PGDATA.
+    # (timescaledb extension + the two price hypertables) against a temporary
+    # preloaded server, then stop. Run from the repo root, then `__pg` to serve.
+    # DESTRUCTIVE: wipes $PGDATA.
     db_reset = writeShellScriptBin "db_reset" ''
       set -euo pipefail
       : "''${PGDATA:?PGDATA not set (enter the nix shell)}"
       : "''${PGPORT:?PGPORT not set (enter the nix shell)}"
+      # Network auth secret from .env (gitignored). Needed to set the role password
+      # and open pg_hba to the tailscale peer. Set a real value before exposing.
+      # Pull just POSTGRES_PASSWORD from .env without executing it (.env holds
+      # values with spaces/parens that would break `source`).
+      if [ -f .env ]; then
+        POSTGRES_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' .env | tail -1 | cut -d= -f2-)"
+      fi
+      : "''${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (network auth)}"
       if [ ! -f init/01_schema.sql ]; then
         echo "run from the repo root (init/01_schema.sql not found)" >&2
         exit 1
@@ -65,6 +77,12 @@ let
       echo "==> load init/01_schema.sql"
       ${pg}/bin/psql -h localhost -p "$PGPORT" -U ${name} -d ${name} \
         -v ON_ERROR_STOP=1 -f init/01_schema.sql
+      echo "==> set role password + open pg_hba to tailscale peer (atlantis)"
+      ${pg}/bin/psql -h localhost -p "$PGPORT" -U ${name} -d ${name} -v ON_ERROR_STOP=1 \
+        -c "ALTER ROLE \"${name}\" WITH PASSWORD '$POSTGRES_PASSWORD'"
+      if ! grep -q "100.88.30.31/32" "$PGDATA/pg_hba.conf"; then
+        echo "host all all 100.88.30.31/32 scram-sha-256" >> "$PGDATA/pg_hba.conf"
+      fi
       echo "==> stop temporary server"
       kill "$srv"; wait "$srv" 2>/dev/null || true
       trap - EXIT
@@ -80,6 +98,7 @@ in
   inherit name;
   NIXUP = "0.0.10";
   shellHook = ''
+    export PGDATA="$PWD/.db"
     export PGPORT=5433
   '';
 })) // { inherit scripts; }
