@@ -1,0 +1,48 @@
+services:
+  db:
+    image: timescale/timescaledb:2.17.2-pg16   # TODO: confirm/pin current tag on Docker Hub
+    container_name: ge-data-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ge-data
+      POSTGRES_USER: ge-data
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "5000:5432"        # host:container — see docs/database-setup.md (port note)
+    volumes:
+      - pgdata:/var/lib/postgresql/data        # data survives container rebuilds
+      - ./init:/docker-entrypoint-initdb.d:ro  # schema, runs ONCE on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ge-data -d ge-data"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Always-on forward ingester (mapping loader + 5m + 1m collectors).
+  # Exactly one instance — never scale (duplicate polling risks API rate-limits).
+  ingester:
+    build: ./ingester
+    command: ["serve"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ge-data:${POSTGRES_PASSWORD}@db:5432/ge-data
+      USER_AGENT: ${INGESTER_USER_AGENT:?set INGESTER_USER_AGENT in .env}
+    restart: unless-stopped
+
+  # One-off historical backlog. NOT started by `up` (profiles).
+  # Run with:  docker compose run --rm backfill
+  backfill:
+    build: ./ingester
+    command: ["backfill", "--since=2021-03-01"]
+    profiles: ["jobs"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ge-data:${POSTGRES_PASSWORD}@db:5432/ge-data
+      USER_AGENT: ${INGESTER_USER_AGENT:?set INGESTER_USER_AGENT in .env}
+
+volumes:
+  pgdata:
