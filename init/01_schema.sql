@@ -4,6 +4,27 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- ---------------------------------------------------------------------------
+-- items: full item metadata from the Wiki /mapping endpoint, one column per
+-- field (the /mapping shape is small and fixed). Plain table, NOT a hypertable.
+-- The price tables do not depend on this table (no FK), so a price can reference
+-- an item before /mapping is loaded. Re-run /mapping occasionally
+-- (ON CONFLICT (item_id) DO UPDATE) to catch new items / changed metadata.
+--   buy_limit <- /mapping "limit" (limit is a SQL reserved word).
+-- ---------------------------------------------------------------------------
+CREATE TABLE items (
+  item_id   integer PRIMARY KEY,   -- /mapping "id"
+  name      text NOT NULL,
+  examine   text,
+  members   boolean,
+  value     integer,
+  lowalch   integer,
+  highalch  integer,
+  buy_limit integer,               -- /mapping "limit"
+  icon      text
+);
+CREATE INDEX items_name_lower_idx ON items (lower(name));  -- name -> id search
+
+-- ---------------------------------------------------------------------------
 -- prices_5m: 5-minute series, from the Wiki /5m endpoint. Carries volume.
 --   - avg_* prices are NULLABLE on purpose: a price is null exactly when that
 --     side's volume is 0 (no trade cleared). Keep the nulls; never zero-fill.

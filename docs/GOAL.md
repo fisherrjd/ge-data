@@ -17,6 +17,12 @@ database, from **two polls** of the Wiki real-time prices API.
 
 Both are forward-only: the DB starts empty and grows from when polling begins.
 
+Plus one occasional load: `/mapping` → `items`, one typed column per field
+(`item_id`, `name`, `examine`, `members`, `value`, `lowalch`, `highalch`,
+`buy_limit`, `icon`) so prices aren't just naked numbers. Not a poll; upsert it
+on startup and again every ~24h (`ON CONFLICT (item_id) DO UPDATE`) to pick up
+new items.
+
 ## Notes
 
 * **Keep the nulls.** A price is null exactly when nothing traded that side

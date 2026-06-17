@@ -18,8 +18,23 @@ extension and ships compression enabled.
 
 ## Schema (`init/01_schema.sql`)
 
-Two hypertables, one per poll. Both keyed `(ts, item_id)`, both compressed
-(segment by `item_id`, order by `ts`) after 7 days.
+A static `items` lookup plus two hypertables, one per poll. The hypertables are
+keyed `(ts, item_id)` and compressed (segment by `item_id`, order by `ts`) after
+7 days.
+
+- **`items`** — from `/mapping`, one typed column per field: `item_id` (the
+  mapping's `id`), `name`, `examine`, `members`, `value`, `lowalch`, `highalch`,
+  `buy_limit` (the mapping's `limit`), `icon`. Plain table, not a hypertable. No
+  foreign key from the price tables, so a price can reference an item before
+  `/mapping` is loaded. The whole feed is ~4.5k items / ~830 KB — one cheap GET.
+
+  **Refresh:** upsert on startup, then again every ~24h while running. Always
+  `INSERT ... ON CONFLICT (item_id) DO UPDATE` — never truncate-and-reload (that
+  leaves a window where `items` is empty, and a failed fetch would nuke the table
+  for nothing). New items land with game updates (~weekly), so a long-running
+  poller needs the daily refresh, not just the startup load — but if the new item
+  isn't in `items` yet it's harmless: prices still record under its `item_id`,
+  it just has no name until the next refresh.
 
 - **`prices_5m`** — from `/5m`. `avg_high_price`, `avg_low_price` (nullable),
   `high_volume`, `low_volume`. 1-month chunks.
@@ -32,8 +47,7 @@ Write semantics:
   keeps settling while you poll it, so the row converges to the final average.
 - **1m** → dedup on change: only insert when `high_time`/`low_time` advanced.
 
-`item_id` is just an integer column — no `items` table, no foreign key. Prices
-don't depend on item metadata.
+Prices store `item_id` only; join `items` when you want names.
 
 ## Container (`docker-compose.yml`)
 
