@@ -49,27 +49,18 @@ Write semantics:
 
 Prices store `item_id` only; join `items` when you want names.
 
-## Container (`docker-compose.yml`)
+## Running the DB locally (`docker-compose.yml`)
 
-```yaml
-services:
-  db:
-    image: timescale/timescaledb:2.17.2-pg16   # pin a real tag; never :latest
-    environment:
-      POSTGRES_DB: ge-data
-      POSTGRES_USER: ge-data
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-    ports:
-      - "5000:5432"                              # host:container
-    volumes:
-      - pgdata:/var/lib/postgresql/data          # data survives rebuilds
-      - ./init:/docker-entrypoint-initdb.d:ro    # schema, runs ONCE on first boot
-```
+The single-host local target is [`docker-compose.yml`](../docker-compose.yml) (one
+`db` service on `timescale/timescaledb`). The three details that matter:
 
 - **Named volume `pgdata`** — data lives outside the container lifecycle.
-- **`./init` mount** — runs only on first boot (empty volume); it will **not**
-  re-run for later migrations.
+- **`./init` mount** (`/docker-entrypoint-initdb.d`) — runs only on first boot of an
+  empty volume; it will **not** re-run for later migrations.
 - **Port 5000**, not 5432, to avoid a system Postgres already on 5432.
+
+The nix dev shell (`default.nix`, `__pg` + `db_reset`) is the other local option;
+**production runs on eldo**, not a container — see [`INFRA.md`](./INFRA.md).
 
 ## Running it
 

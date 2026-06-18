@@ -59,6 +59,15 @@ SELECT add_compression_policy('prices_5m', INTERVAL '7 days');
 --     last-known values every minute, so only insert when one of them advanced
 --     (dedup on change) to avoid storing identical rows.
 --   - ts is the poll minute. PK (ts, item_id). Denser than 5m, so 1-week chunks.
+--   - margin is the post-tax flip margin (sell at high, buy at low), computed
+--     by the ingester, NOT a generated column: NULL when either side is NULL.
+--     GE tax is 2% of the sale floored, capped at 5M, charged to the SELLER
+--     only -- exactly high/50 (integer division). So
+--       margin = high - LEAST(high/50, 5000000) - low.
+--     Can be negative for illiquid items (last insta-sell above last insta-buy)
+--     and is "never simultaneously real": high/low can be from different times
+--     (see high_time/low_time). The /50 encodes 2% as of the 2025-05-29 rate
+--     change; backfill of older rows would need a date-aware rate.
 -- ---------------------------------------------------------------------------
 CREATE TABLE prices_1m (
   ts        timestamptz NOT NULL,
@@ -67,6 +76,7 @@ CREATE TABLE prices_1m (
   high_time timestamptz,
   low       bigint,
   low_time  timestamptz,
+  margin    bigint,
   PRIMARY KEY (ts, item_id)
 );
 

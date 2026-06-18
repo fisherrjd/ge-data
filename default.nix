@@ -19,6 +19,7 @@ let
       go
       go-tools
       gopls
+      gcc
     ];
     scripts = pkgs.lib.attrsets.attrValues scripts;
   };
