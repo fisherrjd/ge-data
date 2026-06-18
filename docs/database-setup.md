@@ -13,8 +13,9 @@ We use it for two things on append-only, time-ordered, grows-forever data:
 2. **Columnar compression** — old chunks get compressed hard (OSRS price rows
    are tiny and repetitive, the ideal case). This is the reason to use Timescale.
 
-We run the official `timescale/timescaledb` Docker image, which preloads the
-extension and ships compression enabled.
+We run pg16 with the `timescaledb` extension preloaded — locally via the nix dev
+shell, in production via eldo's NixOS `services.postgresql` (see
+[`INFRA.md`](./INFRA.md)).
 
 ## Schema (`init/01_schema.sql`)
 
@@ -49,39 +50,35 @@ Write semantics:
 
 Prices store `item_id` only; join `items` when you want names.
 
-## Running the DB locally (`docker-compose.yml`)
+## Running the DB locally (nix dev shell)
 
-The single-host local target is [`docker-compose.yml`](../docker-compose.yml) (one
-`db` service on `timescale/timescaledb`). The three details that matter:
-
-- **Named volume `pgdata`** — data lives outside the container lifecycle.
-- **`./init` mount** (`/docker-entrypoint-initdb.d`) — runs only on first boot of an
-  empty volume; it will **not** re-run for later migrations.
-- **Port 5000**, not 5432, to avoid a system Postgres already on 5432.
-
-The nix dev shell (`default.nix`, `__pg` + `db_reset`) is the other local option;
-**production runs on eldo**, not a container — see [`INFRA.md`](./INFRA.md).
-
-## Running it
+Local dev runs a real Postgres from the nix shell — no container. `default.nix`
+provides a `pg16 + timescaledb` server plus two scripts: `db_reset` (one-shot
+prepare) and `__pg` (serve). PGDATA is `.db/`, port **5433** (set by the shell
+hook). **Production runs on eldo**, not here — see [`INFRA.md`](./INFRA.md).
 
 ```bash
 # 1. create .env with a password (see .env.example)
-# 2. start (first run executes init/*.sql)
-docker compose up -d
+# 2. enter the shell (exports PGDATA=.db, PGPORT=5433)
+nix-shell   # or via direnv (.envrc)
 
-# 3. connect from the host
-psql "postgresql://ge-data:${POSTGRES_PASSWORD}@localhost:5000/ge-data"
+# 3. wipe + bootstrap + load init/01_schema.sql (DESTROYS DATA in .db/)
+db_reset
+
+# 4. serve
+__pg
+
+# 5. connect from another shell
+psql "postgresql://ge-data:${POSTGRES_PASSWORD}@localhost:5433/ge-data"
 #   \dx            -> timescaledb listed
 #   \d+ prices_5m  -> hypertable
-
-# wipe and start clean (DESTROYS DATA):
-docker compose down -v
 ```
 
-Apply later schema changes by hand (init scripts won't re-run):
+`db_reset` loads the schema once against a temporary preloaded server; apply later
+schema changes by hand:
 
 ```bash
-psql "postgresql://...@localhost:5000/ge-data" -f init/02_something.sql
+psql "postgresql://...@localhost:5433/ge-data" -f init/02_something.sql
 ```
 
 ## References

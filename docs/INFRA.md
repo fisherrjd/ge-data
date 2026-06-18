@@ -1,12 +1,12 @@
-# ge-data: Infrastructure
+# ge-data: Infrastructure & Ops
 
-What this system needs to run, and how it's packaged in each environment. See
-[`GOAL.md`](./GOAL.md) for what we collect and [`database-setup.md`](./database-setup.md)
-for the schema.
+What this system needs to run, how it's packaged per environment, and how the
+ingester gets built, released, and deployed. See [`GOAL.md`](./GOAL.md) for what we
+collect and [`database-setup.md`](./database-setup.md) for the schema.
 
 The design rule: **the requirements below are identical everywhere.** Only the
-*packaging* changes (nix shell → Docker Compose → eldo + k3s). Satisfy them locally
-first, confirm the system works, then re-satisfy the same list in production.
+*packaging* changes (nix shell → eldo + k3s). Satisfy them locally first, confirm the
+system works, then re-satisfy the same list in production.
 
 ## Components
 
@@ -40,12 +40,18 @@ let it fill.
 
 | Requirement | Value | Why |
 |---|---|---|
-| **Single instance** | exactly 1, always | see below — this is the rule that's easy to break by accident |
+| **Single instance** | exactly 1, always | see below — the rule that's easy to break by accident |
 | DB connectivity | reach the DB on 5432 | `DATABASE_URL=postgresql://ge-data:<pw>@<db-host>:5432/ge-data` |
 | Outbound HTTPS | to `prices.runescape.wiki:443` | the only external dependency; must not be firewalled off |
 | `USER_AGENT` | descriptive: project + contact | **mandatory** — blank/generic UAs get blocked |
 | Resources | ~10m CPU / 32–128Mi RAM | trivial workload: a few GETs/min + batched inserts |
 | Restart policy | restart on crash | a bad fetch shouldn't end the process, but crashes should self-heal |
+| Inbound | none | it's a collector — no Service, LB, or ingress |
+
+Logs are structured (`log/slog`, logfmt) to stderr — `kubectl logs`. Lifecycle:
+`ingester started` / `ingester shut down cleanly`; per-loop `tick failed`
+(`loop=`, `err=`) on a bad tick. The "it's working" signal is the per-tick writes:
+`mapping refreshed`, `5m block written`, `1m tick written` (each with row counts).
 
 ### The single-instance rule (why, and how it's enforced)
 
@@ -55,32 +61,37 @@ concurrency — two pollers would double-poll, risk double-inserts, and invite a
 Wiki-API block. So there must never be more than one, even momentarily.
 
 Enforced per environment:
-- **local**: you run one `go run` / one compose service. Just don't start two.
+- **local**: you run one `go run`. Just don't start two.
 - **k3s**: `replicas: 1` **and** a deploy strategy that never briefly runs two
   (`maxSurge: 0`, or `Recreate`). Never an HPA. For HA later, use a
   leader-election Lease, not more replicas.
 
 ## Secrets & config
 
-Two secret values, same everywhere; only the delivery differs:
+The ingester needs `DATABASE_URL` and `USER_AGENT`; the DB needs a role password.
+Delivery differs per environment:
 
-| Key | Used by | Local | Production |
+| Value | Used by | Local | Production |
 |---|---|---|---|
-| `POSTGRES_PASSWORD` | DB + ingester | `.env` (gitignored) | k8s `Secret ge-data-db` |
+| DB role password | DB + (inside `DATABASE_URL`) | `POSTGRES_PASSWORD` in `.env` (gitignored) | set on the `ge-data` role out-of-band; also embedded in the Secret's `DATABASE_URL` |
+| `DATABASE_URL` | ingester | composed from `.env` + `localhost:5433` | **whole string** in k8s `Secret ge-data-db` (host = `10.42.0.1`) |
 | `USER_AGENT` | ingester | `.env` | k8s `Secret ge-data-db` |
 
-`DATABASE_URL` is *derived* from the password + the DB's address — the address is
-the main thing that changes per environment (table below).
+In production the Secret carries the **entire** `DATABASE_URL` (host + password) plus
+`USER_AGENT`; the pod gets both via `envFrom`. Keeping the host and password in the
+Secret means the ops repo embeds no DB topology or credentials.
 
 ## The environments
 
-Same requirements, three packagings. Develop left-to-right.
+Same requirements, two packagings. Develop locally, then production.
 
 | | DB packaging | Ingester packaging | DB address (for `DATABASE_URL`) |
 |---|---|---|---|
-| **nix dev** (`default.nix`) | `__pg` local server, `.db/` PGDATA, port **5433** | `go run ./ingester` from the shell | `localhost:5433` |
-| **docker-compose** | `timescale/timescaledb` service `db`, port **5000** | `go run`, or add an `ingester` service | `localhost:5000` (host) / `db:5432` (in-net) |
-| **production** | **eldo**, NixOS `services.postgresql` (pg16 + timescaledb), tailnet | container on **k3s**, namespace `osrs-ge`, deployed via the **ops repo** | `100.66.184.28:5432` (eldo tailnet IP) |
+| **local** (`default.nix`) | `pg16 + timescaledb` from the nix shell (`db_reset` + `__pg`), `.db/` PGDATA, port **5433** | `go run ./ingester` from the shell | `localhost:5433` |
+| **production** | **eldo**, NixOS `services.postgresql` (pg16 + timescaledb), tailnet | container on **k3s**, namespace `osrs-ge`, deployed via the **ops repo** | `10.42.0.1:5432` (eldo's flannel gateway / `cni0`) |
+
+(`docker-compose.yml` is also present as a single-host container DB option; the nix
+shell is the primary local path — see [`database-setup.md`](./database-setup.md).)
 
 ### Production specifics
 
@@ -88,42 +99,96 @@ Same requirements, three packagings. Develop left-to-right.
   (`services.postgresql`: pg16, `timescaledb` preloaded, `ge-data` DB + role,
   `enableTCPIP`, firewall 5432, a `pg_hba` rule for the connecting source). The
   NixOS config creates an **empty** `ge-data` database; the role password and the
-  schema are applied out-of-band (see "Schema loading").
+  schema are applied out-of-band (see "Schema loading" and "First-time bootstrap").
 - **Ingester deploys via the ops repo** (`~/github/jade/ops`), not from manifests in
   this repo. A `hex.k8s.services.build` def (`svc/ge-data-ingester.nix`, wired into
-  `specs.nix`) renders the Deployment: `replicas: 1`, `maxSurge: 0`, no Service/LB
-  (it's a collector, nothing inbound), `imagePullSecrets: ghcr-secret`, env from
-  `Secret ge-data-db`, `DATABASE_URL` pointing at eldo's tailnet IP.
-- **Image**: `ghcr.io/fisherrjd/ge-data:<tag>`, built from `ingester/Dockerfile` by
-  `.github/workflows/docker-publish.yml` (tag driven by the repo-root `VERSION`).
-- **pg_hba caveat**: k3s/flannel masquerades pod traffic to off-cluster destinations,
-  so postgres sees the connection from **eldo's tailnet IP**, not the pod CIDR — the
-  `pg_hba` rule must match that source. Verify once live with
-  `SELECT client_addr FROM pg_stat_activity WHERE usename = 'ge-data';`.
+  `specs.nix`) renders the Deployment: `replicas: 1`, `maxSurge: 0`, no Service/LB,
+  `imagePullSecrets: ghcr-secret`, and `envFrom` the `ge-data-db` Secret (which
+  carries the whole `DATABASE_URL` + `USER_AGENT`).
+- **Why `DATABASE_URL` uses `10.42.0.1`**: the pod has its own netns (so `localhost`
+  is empty) and flannel SNATs pod→off-cluster traffic (so eldo's tailnet IP would
+  appear as a new source needing a new `pg_hba` rule). Dialing the flannel gateway
+  `10.42.0.1` (eldo's `cni0`, where Postgres also listens) keeps the source inside
+  `10.42.0.0/16` — which eldo's **existing** `pg_hba` rule already authorizes, so
+  **no new rule and no `nixos-rebuild`** are needed. Verify once live with
+  `SELECT client_addr FROM pg_stat_activity WHERE usename = 'ge-data';` (expect a
+  `10.42.x.x` address). Single-node assumption: if the cluster grows, pin the pod to
+  eldo so `10.42.0.1` is eldo's gateway.
 
 ## Schema loading
 
 All environments load the **same** `init/01_schema.sql`, but how/when differs:
 
-- **nix dev**: `db_reset` runs it explicitly against a preloaded server.
-- **docker-compose**: runs via `/docker-entrypoint-initdb.d` **only on first boot of
-  an empty volume** — it will NOT re-run for later migrations.
+- **local (nix)**: `db_reset` runs it explicitly against a preloaded server.
 - **production (eldo)**: applied **once, by hand**, into eldo's `ge-data` DB (the
   NixOS config only ensures the empty database exists).
 
-> Drift watch: three paths, one file, but most apply it only once. Past v1, adopt a
+> Drift watch: one file, but each path applies it only once. Past v1, adopt a
 > migration tool (golang-migrate/goose) so schema changes apply the same way
 > everywhere.
 
-## Going live — remaining steps
+## Build & release
 
-The ingester code, `Dockerfile`, and image workflow are done. To deploy:
+Two repos: **`fisherrjd/ge-data`** (this one) builds and publishes the ingester
+image to GHCR via `.github/workflows/docker-publish.yml`; **`fisherrjd/ops`**
+consumes a published tag (`svc/ge-data-ingester.nix` pins it) and builds nothing.
 
-1. **ops**: write `svc/ge-data-ingester.nix`, wire it into `specs.nix`.
-2. **cluster**: ensure the `osrs-ge` namespace + `ghcr-secret`; `kubectl apply` the
-   `ge-data-db` Secret (`POSTGRES_PASSWORD`, `USER_AGENT`).
-3. **eldo**: add the `pg_hba` rule for the ingester's source IP, set the `ge-data`
-   role password (matching the Secret), `nixos-rebuild`.
-4. **eldo**: load `init/01_schema.sql` into the `ge-data` DB (one-time).
-5. **deploy + verify**: apply the ops stack, watch the pod, confirm rows land in
-   `prices_5m`/`prices_1m`, and check `client_addr` validates the `pg_hba` CIDR.
+The image version comes from the repo-root **`VERSION`** file — the single source of
+truth. The workflow runs on every branch push:
+
+| You push… | Image tag | Use for |
+|---|---|---|
+| merge to `main` | `:X.Y.Z` (immutable) | **releases — pin this in ops** |
+| any other branch | `:X.Y.Z-b<short-sha>` | a throwaway build to test on the cluster |
+
+On a `main` build CI also git-tags the commit `vX.Y.Z`, then bumps the patch in
+`VERSION` and commits it back (`[skip ci]`), so `main` always sits on the next
+unreleased version. Tags are immutable — a `main` build whose `VERSION` already
+exists in GHCR **fails the guard step** rather than overwriting it.
+
+**SemVer** (`MAJOR.MINOR.PATCH`, currently `0.x`):
+- **PATCH** — bug fixes. Automatic: every merge to `main` ships the current version
+  and bumps the patch.
+- **MINOR/MAJOR** — features / breaking changes. Bump `VERSION` in the PR; CI ships
+  it, then auto-bumps the patch.
+
+**Cut a release:** land work on `main` for a patch; for minor/major bump `VERSION` in
+the PR first. There is no manual `git tag` step. Verify the Actions run is green and
+the tag appears on the GHCR package page
+(`https://github.com/fisherrjd/ge-data/pkgs/container/ge-data`).
+
+## Deploy
+
+Routine deploy — in **`fisherrjd/ops`**, edit `svc/ge-data-ingester.nix`:
+
+```nix
+, image ? "ghcr.io/fisherrjd/ge-data:0.1.0"
+```
+
+Then from the ops repo preview with `hex --dryrun -t specs.nix` and apply with `hex`.
+k8s won't re-pull an identical tag without `imagePullPolicy: Always` + a rollout
+restart, so a real release means a new tag.
+
+**Test a feature branch on the cluster** (no release): push the branch → CI builds
+`:X.Y.Z-b<sha>`; point `svc/ge-data-ingester.nix` at that tag and apply; revert to
+the pinned release tag when done. Mind the single-instance rule — don't leave a
+feature-branch pod running alongside the release pod.
+
+> The GHCR package is private; the cluster pulls it with `ghcr-secret`, so make the
+> package visible to that token (or public). Branch pushes accumulate `*-b<sha>`
+> images — set a retention policy on the package if it gets noisy.
+
+## First-time bootstrap
+
+One-time setup before the first deploy (routine deploys above don't repeat these):
+
+1. **ops** *(done)*: `svc/ge-data-ingester.nix` written and wired into `specs.nix`.
+2. **eldo** *(done)*: `ge-data` role password set out-of-band; `init/01_schema.sql`
+   loaded into the `ge-data` DB (extension as `postgres`, tables as `ge-data`).
+   **No new `pg_hba` rule** — the ingester dials `10.42.0.1`, covered by the existing
+   `10.42.0.0/16` rule.
+3. **cluster**: ensure the `osrs-ge` namespace + `ghcr-secret`; `kubectl apply` the
+   `ge-data-db` Secret with the **whole** `DATABASE_URL`
+   (`postgresql://ge-data:<pw>@10.42.0.1:5432/ge-data?sslmode=disable`) + `USER_AGENT`.
+4. **deploy + verify**: `hex` the ops stack, watch the pod, confirm rows land in
+   `prices_5m`/`prices_1m`, and check `client_addr` shows a `10.42.x.x` source.
