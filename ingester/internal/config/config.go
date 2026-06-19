@@ -34,7 +34,16 @@ func Load() (Config, error) {
 		UserAgent:       os.Getenv("USER_AGENT"),
 		MappingInterval: 24 * time.Hour,
 		Poll5mInterval:  5 * time.Minute,
-		Poll1mInterval:  1 * time.Minute,
+		// /latest is Cloudflare-cached with max-age=60, so a fresh snapshot
+		// appears at most once every 60s. We poll at HALF that (30s) so the
+		// poll phase can't drift into lockstep with the cache and read a
+		// ~60s-stale object or skip a generation — at 30s we catch every
+		// generation within 30s. Still named "1m": the cache, not the poll,
+		// sets the real granularity. Safe to over-poll: the collector dedups
+		// on (high_time, low_time) advance and the insert is DO NOTHING, and
+		// since generations are 60s apart there's at most one emit per item
+		// per minute (no PK collision against the minute-truncated ts).
+		Poll1mInterval: 30 * time.Second,
 	}
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("DATABASE_URL is required")
